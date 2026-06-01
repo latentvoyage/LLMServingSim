@@ -325,12 +325,15 @@ def main():
         
         # Make scheduler for each instance
 
+        # Encoder instances never use chunked prefill (ViT processes all patches in one pass)
+        inst_chunked_prefill = False if instance["pd_type"] == "encoder" else enable_chunked_prefill
+
         schedulers.append(Scheduler(
             instance["model_name"], instance["node_id"], instance_id, max_num_seqs, max_num_batched_tokens,
             instance["num_npus"], instance["tp_size"], instance["pp_size"],
             instance["npu_mem"]["mem_size"], cpu_mem_size[instance["node_id"]],
             inst2npu_mapping[instance_id], instance["pd_type"], fp, block_size, num_req,
-            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, enable_chunked_prefill,
+            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, inst_chunked_prefill,
             long_prefill_token_threshold,
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
@@ -458,16 +461,20 @@ def main():
         gen_th += gen_t
         total_gen += gen_t
         # count only finished requests
-        req_cnt += len(finished_reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+        req_cnt += len(finished_reqs) if instances[instance_id]["pd_type"] not in ("prefill", "encoder") else 0
 
         # Notify router of completed requests for dependency chain release
-        if instances[instance_id]["pd_type"] != "prefill":
+        if instances[instance_id]["pd_type"] not in ("prefill", "encoder"):
             for req in finished_reqs:
                 router.notify_request_completed(req.id, current)
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
             router.transfer_prefill_request(finished_reqs)
+
+        # Add encoder ended requests to prefill instance
+        if instances[instance_id]["pd_type"] == "encoder" and len(finished_reqs) > 0:
+            router.transfer_encoder_request(finished_reqs)
 
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)
@@ -596,13 +603,19 @@ def main():
                         responded = True
                 else:
                     # Independent instance: generate trace immediately
-                    generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
-                                   instance["local_ep"], instance["ep_total"],
-                                   instance["pd_type"],
-                                   node_id, instance_id, max_num_batched_tokens, max_num_seqs, placement[instance_id], block_mode_on[instance_id],
-                                   expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id],
-                                   enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
-                                   enable_block_copy=enable_block_copy)
+                    if instance["pd_type"] == "encoder":
+                        # Encoder instance uses analytical model
+                        from serving.core.trace_generator import generate_encoder_trace
+                        generate_encoder_trace(new_req, instance["hardware"], node_id, instance_id,
+                                              get_config(instance["model_name"]), fp=fp // 8)
+                    else:
+                        generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
+                                       instance["local_ep"], instance["ep_total"],
+                                       instance["pd_type"],
+                                       node_id, instance_id, max_num_batched_tokens, max_num_seqs, placement[instance_id], block_mode_on[instance_id],
+                                       expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id],
+                                       enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
+                                       enable_block_copy=enable_block_copy)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
                     workload = get_workload(new_req, instance["hardware"], instance_id)

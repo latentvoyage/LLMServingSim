@@ -52,10 +52,110 @@ class Scheduler:
     
  
     def schedule(self, current, sys, batch_id=-1):
-        if self.enable_prefix_caching:
+        if self.pd_type == "encoder":
+            return self.schedule_encoder(current, sys, batch_id)
+        elif self.enable_prefix_caching:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
             return self.schedule_base(current, sys, batch_id)
+
+    # =========================================================================
+    # Encoder-specific scheduling: resolution-aware greedy bin-packing
+    # =========================================================================
+
+    def schedule_encoder(self, current, sys, batch_id=-1):
+        """Simple FCFS encoder scheduler.
+
+        Fills a batch up to token/seq budget in arrival order.
+        Resolution grouping into sub-batches is handled at trace generation
+        time (sub-batches execute sequentially on GPU).
+        """
+        if sys == self.start_npu:
+            if len(self.request) != 0 and self.request[0].arrival > current:
+                return None
+            if len(self.inflight) >= self.pp_size:
+                return None
+
+            arrived = [req for req in self.request if req.arrival <= current]
+            if not arrived:
+                return None
+
+            # ---- Simple FCFS fill to budget ----
+            encoder_token_budget = self.max_num_batched_tokens
+            max_seqs = int(self.max_num_seqs)
+            batch_req = []
+            total_image_tokens = 0
+
+            for req in arrived:
+                if len(batch_req) >= max_seqs:
+                    break
+                req_image_tokens = req.image_tokens if req.image_tokens > 0 else req.input
+                if total_image_tokens + req_image_tokens > encoder_token_budget and batch_req:
+                    break
+                batch_req.append(req)
+                total_image_tokens += req_image_tokens
+
+            if not batch_req:
+                return None
+
+            # ---- Remove from request queue ----
+            for req in batch_req:
+                for i, req_ in enumerate(self.request):
+                    if req_.id == req.id:
+                        del self.request[i]
+                        break
+
+            # ---- Build scheduled_tokens ----
+            scheduled_tokens = {}
+            total_len = 0
+            q_list = []
+            for req in batch_req:
+                tokens = req.image_tokens if req.image_tokens > 0 else req.input
+                scheduled_tokens[req.id] = tokens
+                total_len += tokens
+                q_list.append(tokens)
+                if req.is_init:
+                    req.set_que_delay(current)
+
+            # ---- Memory allocation ----
+            kv_size = self.memory.get_block_kv(batch_req, len(batch_req), scheduled_tokens)
+            if kv_size > 0 and not self.memory.is_avail(kv_size, Device.NPU):
+                for req in batch_req:
+                    bisect.insort(self.request, req, key=lambda r: (r.arrival, r.id))
+                return None
+            if kv_size > 0:
+                self.memory.allocate(kv_size, Device.NPU)
+
+            # ---- Build Batch object ----
+            batch = Batch(
+                self.get_batch_id(), self.model, total_len, 0,
+                q_list, [], len(batch_req), 0,
+                q_list, [], [], current, kv_size, 0, 0
+            )
+            batch.fired.append(sys)
+            batch.requests.extend(batch_req)
+            batch.scheduled_tokens = scheduled_tokens
+            self.inflight.append(batch)
+            self.logger.info(
+                "Encoder batch #%d: %d requests, %d image tokens",
+                batch.batch_id, len(batch_req), total_len,
+            )
+            return batch
+
+        # Non-first NPU: pick up existing batch
+        else:
+            if len(self.inflight) == 0:
+                return None
+            batch = None
+            for b in self.inflight:
+                if b.batch_id == batch_id:
+                    batch = b
+            if batch is None:
+                return None
+            if sys in batch.fired:
+                return None
+            batch.fired.append(sys)
+            return batch
 
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
@@ -671,16 +771,25 @@ class Scheduler:
             # add to done system
             batch.end.append(sys)
             # check all npus are done
-            if self.pd_type != "prefill":
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
+            if self.pd_type == "prefill":
+                if self.start_npu not in batch.end or (self.start_npu + self.num_npus * 2 - 1) not in batch.end:
                     return prompt_t, gen_t, end_reqs
             else:
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus * 2 - 1) not in batch.end:
+                if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
                     return prompt_t, gen_t, end_reqs
         self.logger.info(
             "Batch #%d is done",
             batch.batch_id,
         )
+
+        # Encoder instance: all requests in the batch are "encoded" — transfer to prefill
+        if self.pd_type == "encoder":
+            for req in batch.requests:
+                req.encoder_done = True
+                end_reqs.append(req)
+            del self.inflight[idx]
+            del batch
+            return prompt_t, gen_t, end_reqs
                 
         pool = []
         for req in batch.requests:
@@ -808,11 +917,22 @@ class Scheduler:
         return self.batch_ids
 
     # add a request
-    def add_request(self, req, is_init=True):
+    def add_request(self, req, is_init=True, image_tokens=0, num_images=0, image_resolution=0):
         new_req = Request(*(req), is_init=is_init)
+        # Set multimodal fields
+        new_req.image_tokens = image_tokens
+        new_req.num_images = num_images
+        new_req.image_resolution = image_resolution
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
         return
+
+    # add request from encoder instance to prefill instance
+    def add_request_from_encoder(self, req):
+        """Receive an encoded request from the encoder instance.
+        The encoder has processed image tokens; now the request needs prefill."""
+        req.encoder_done = True
+        bisect.insort(self.request, req, key=lambda r: (r.arrival, r.id))
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):

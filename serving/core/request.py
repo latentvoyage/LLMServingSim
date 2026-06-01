@@ -39,20 +39,27 @@ class Request:
         self.session_id = None
         self.sub_request_index = None
 
+        # For multimodal encoder support
+        self.image_tokens = 0           # Number of visual tokens from encoder
+        self.num_images = 0             # Number of images in this request
+        self.image_resolution = 0       # Image resolution (pixels per side)
+        self.encoder_done = False       # Whether encoder phase is complete
+        self.encoder_output_size = 0    # Bytes of encoder embeddings to transfer
+
     # to print the request information
     def __str__(self):
         return str(self.__dict__) 
 
     def add_latency(self, end_time):
         self.end_time = end_time
-        self.latency = self.end_time - self.arrival
+        self.latency = self.end_time - self.arrival ## overall completion time of the request
         self.input = self.original_input
         if self.output == self.input + 1:
             self.tpot = 0
         else:
-            self.tpot = (self.latency - self.ttft) // (self.output - self.input - 1)
+            self.tpot = (self.latency - self.ttft) // (self.output - self.input - 1) # divding total decode latency by total decode tokens
     
-    def add_itl(self, current): # 
+    def add_itl(self, current): # tracking the recent tokens' end timing, and storing the itl latencies
         self.itl.append(current - self.recent_end)
         self.recent_end = current
 

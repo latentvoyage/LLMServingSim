@@ -1289,6 +1289,94 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
+# ======================================================================
+# Encoder trace generation (analytical model)
+# ======================================================================
+
+def generate_encoder_trace(batch, hardware, node_id, instance_id, config, fp=2):
+    """Generate a trace file for the vision encoder using analytical latency model.
+
+    Images in the batch are grouped into sub-batches by resolution (greedy
+    bin-matching). Sub-batches execute sequentially on the GPU — total latency
+    is the sum across sub-batches. This matches how vLLM processes mixed-resolution
+    encoder batches (cannot batch different-sized tensors in one forward pass).
+    """
+    from .encoder_model import EncoderLatencyModel
+
+    output_path = f"inputs/trace/{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}.txt"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    llm_hidden = config.get('hidden_size', 4096)
+    encoder = EncoderLatencyModel(hardware=hardware)
+
+    # ---- Group requests into sub-batches by resolution ----
+    resolution_groups = {}
+    for req in batch.requests:
+        res = req.image_resolution if req.image_resolution > 0 else 336
+        resolution_groups.setdefault(res, []).append(req)
+
+    # Compute per-sub-batch latency (each sub-batch runs sequentially)
+    # Use greedy ordering: largest sub-batch first (maximizes GPU utilization early)
+    sorted_groups = sorted(resolution_groups.items(), key=lambda x: -len(x[1]))
+
+    # Accumulate layers from all sub-batches sequentially
+    all_layers = []
+    total_images = 0
+    for res, reqs in sorted_groups:
+        num_images = sum(req.num_images for req in reqs)
+        if num_images == 0:
+            num_images = len(reqs)
+        total_images += num_images
+
+        # Override encoder patch count for this resolution
+        sub_encoder = EncoderLatencyModel(hardware=hardware)
+        if res != sub_encoder.image_size:
+            # Recalculate num_patches for this resolution
+            sub_encoder.num_patches = (res // sub_encoder.patch_size) ** 2
+
+        sub_layers = sub_encoder.estimate_per_layer_latency_us(num_images, llm_hidden)
+        # Tag sub-batch layers with resolution for trace readability
+        for name, lat_us in sub_layers:
+            all_layers.append((f"{name}_r{res}", lat_us))
+
+    if not all_layers:
+        # Fallback: single image
+        all_layers = encoder.estimate_per_layer_latency_us(1, llm_hidden)
+        total_images = 1
+
+    # Encoder output size (total across all sub-batches)
+    encoder_output_bytes = total_images * encoder.num_patches * encoder.hidden * fp
+
+    # Build trace lines
+    result = []
+    for layer_name, latency_us in all_layers:
+        latency_ns = int(latency_us * 1000)
+        result.append([layer_name, str(latency_ns), 'LOCAL', '0', 'LOCAL', '0', 'LOCAL', '0', 'NONE', '0', 'NONE'])
+
+    # First layer input from REMOTE (image data loaded from CPU)
+    if result:
+        image_input_bytes = total_images * encoder.num_patches * 3 * encoder.patch_size * encoder.patch_size * fp
+        result[0][2] = f'REMOTE:{node_id}'
+        result[0][3] = str(image_input_bytes)
+
+    # Last layer output to REMOTE (encoder embeddings sent to prefill instance)
+    if result:
+        result[-1][6] = f'REMOTE:{node_id}'
+        result[-1][7] = str(encoder_output_bytes)
+
+    # Write trace file
+    with open(output_path, 'w') as f:
+        f.write(f"ENCODER\t\tmodel_parallel_NPU_group: 1\n")
+        f.write(str(len(result)) + '\n')
+        f.write(header())
+
+        for i, line in enumerate(result):
+            new_name = f'{line[0]}_{i}'
+            f.write(formatter(new_name, *line[1:]))
+
+    return output_path
+
+
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                       batch, max_len, output_path, placement, block_mode_on, gate,
                       enable_attn_offloading, power_model, pim_model, fp,
@@ -1536,6 +1624,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
             instance_type = 'PREFILL'
         elif pd_type == 'decode':
             instance_type = 'DECODE'
+        elif pd_type == 'encoder':
+            instance_type = 'ENCODER'
         else:
             raise ValueError(f"Unknown instance type {pd_type}.")
 

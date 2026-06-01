@@ -415,8 +415,8 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                     }
                 npu_mem_enabled = True
 
-            if pd_type not in ["prefill", "decode", None]:
-                raise ValueError(f"Invalid pd_type '{pd_type}' in instance {idx}. Must be 'prefill', 'decode', or omitted.")
+            if pd_type not in ["prefill", "decode", "encoder", None]:
+                raise ValueError(f"Invalid pd_type '{pd_type}' in instance {idx}. Must be 'prefill', 'decode', 'encoder', or omitted.")
 
             # instance_id vs idx stands for node-internal instance numbering.
             # For example, 2 node and each node has 2 instances
@@ -434,6 +434,9 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 prefill_instance.append(instance_id)
             elif pd_type == "decode":
                 decode_instance.append(instance_id)
+            elif pd_type == "encoder":
+                # Encoder uses standard NPU count (no sender duplication)
+                pass
 
             if effective_npus > 1:
                 end_npu_ids += str(current_npu_start + effective_npus - 1) + ","

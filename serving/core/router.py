@@ -14,10 +14,12 @@ class Router:
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
-        self.prefill_schedulers = [s for s in schedulers if s.pd_type != "decode"]
+        self.prefill_schedulers = [s for s in schedulers if s.pd_type not in ("decode", "encoder")]
         self.prefill_instances = len(self.prefill_schedulers)
         self.decode_schedulers = [s for s in schedulers if s.pd_type == "decode"]
         self.decode_instances = len(self.decode_schedulers)
+        self.encoder_schedulers = [s for s in schedulers if s.pd_type == "encoder"]
+        self.encoder_instances = len(self.encoder_schedulers)
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
@@ -53,22 +55,24 @@ class Router:
     # Instance selection policies
     # -----------------------------------------------------------------------
 
-    def _rr_select(self, num_instances):
+    def _rr_select(self, num_instances, schedulers=None):
         idx = self.prefill_rr_counter % num_instances
         self.prefill_rr_counter += 1
         return idx
 
-    def _rand_select(self, num_instances):
+    def _rand_select(self, num_instances, schedulers=None):
         return self._rnd.randrange(num_instances)
 
-    def _least_load_select(self, num_instances):
+    def _least_load_select(self, num_instances, schedulers=None):
         """vLLM-style least-loaded routing: score = waiting * 4 + running."""
+        if schedulers is None:
+            schedulers = self.prefill_schedulers
         best_idx = 0
         best_score = float('inf')
         start = self.prefill_rr_counter % num_instances
         for offset in range(num_instances):
             idx = (start + offset) % num_instances
-            sched = self.prefill_schedulers[idx]
+            sched = schedulers[idx]
             waiting = len(sched.request)
             running = sum(len(b.requests) for b in sched.inflight)
             score = waiting * 4 + running
@@ -78,7 +82,7 @@ class Router:
         self.prefill_rr_counter = (best_idx + 1) % num_instances
         return best_idx
 
-    def _custom_select(self, num_instances):
+    def _custom_select(self, num_instances, schedulers=None):
         raise NotImplementedError("Implement custom routing policy.")
 
     # -----------------------------------------------------------------------
@@ -130,6 +134,10 @@ class Router:
             'input_toks': int(row['input_toks']),
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
+            # Multimodal fields (optional)
+            'image_tokens': int(row.get('image_tokens', 0)),
+            'num_images': int(row.get('num_images', 0)),
+            'image_resolution': int(row.get('image_resolution', 0)),
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
@@ -175,6 +183,8 @@ class Router:
         """Route requests that have arrived by current_time_ns to instances.
 
         Called at the start of each iteration in the main simulation loop.
+        Multimodal requests (image_tokens > 0) go to encoder instances first
+        if encoder instances exist; otherwise directly to prefill.
         Returns the number of newly routed requests.
         """
         routed = 0
@@ -183,8 +193,14 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_instances)
-            sched = self.prefill_schedulers[instance_id]
+            # Route multimodal requests to encoder if encoder instances exist
+            has_images = req_data.get('image_tokens', 0) > 0
+            if has_images and self.encoder_instances > 0:
+                instance_id = self._select_instance(self.encoder_instances, self.encoder_schedulers)
+                sched = self.encoder_schedulers[instance_id]
+            else:
+                instance_id = self._select_instance(self.prefill_instances, self.prefill_schedulers)
+                sched = self.prefill_schedulers[instance_id]
 
             if self._enable_prefix_caching:
                 sched.add_request([
@@ -192,13 +208,17 @@ class Router:
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], instance_id,
                     req_data['input_hash_ids'], req_data['output_hash_ids'],
-                ], is_init=self._is_init)
+                ], is_init=self._is_init, image_tokens=req_data.get('image_tokens', 0),
+                   num_images=req_data.get('num_images', 0),
+                   image_resolution=req_data.get('image_resolution', 0))
             else:
                 sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], instance_id,
-                ], is_init=self._is_init)
+                ], is_init=self._is_init, image_tokens=req_data.get('image_tokens', 0),
+                   num_images=req_data.get('num_images', 0),
+                   image_resolution=req_data.get('image_resolution', 0))
 
             self._pending_idx += 1
             routed += 1
@@ -308,5 +328,14 @@ class Router:
 
     def transfer_prefill_request(self, requests):
         for req in requests:
-            instance_id = self._select_instance(self.decode_instances)
+            instance_id = self._select_instance(self.decode_instances, self.decode_schedulers)
             self.decode_schedulers[instance_id].add_decode(req)
+
+    def transfer_encoder_request(self, requests):
+        """Transfer encoded requests from encoder instance to prefill instance."""
+        for req in requests:
+            req.encoder_done = True
+            instance_id = self._select_instance(self.prefill_instances, self.prefill_schedulers)
+            self.prefill_schedulers[instance_id].add_request_from_encoder(req)
+
+
