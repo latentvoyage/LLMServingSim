@@ -121,9 +121,7 @@ class EncoderLatencyModel:
         # Below this → memory-bound, above → compute-bound
         self.ridge_point = (self.hw["peak_tflops_bf16"] * 1e12) / (self.hw["mem_bw_gbps"] * 1e9)
 
-    # -----------------------------------------------------------------------
-    # Roofline core: per-operation latency estimation
-    # -----------------------------------------------------------------------
+  #per operation latency models 
 
     def _gemm_latency_us(self, M: int, N: int, K: int, num_batches: int = 1) -> float:
         """Estimate GEMM latency using roofline + tile/wave quantization.
